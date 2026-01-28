@@ -1,3 +1,4 @@
+# mcp_neon.py
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -25,7 +26,7 @@ DB_READY = False
 
 
 # ==================================================
-# SQL
+# DATABASE SCHEMA
 # ==================================================
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -78,7 +79,7 @@ CREATE TABLE IF NOT EXISTS settlements (
 
 
 # ==================================================
-# LAZY INITIALIZATION (CRITICAL)
+# LAZY POOL INITIALIZATION
 # ==================================================
 async def get_pool() -> asyncpg.Pool:
     global POOL, DB_READY
@@ -89,6 +90,7 @@ async def get_pool() -> asyncpg.Pool:
             min_size=1,
             max_size=5,
         )
+        print("✅ Connected to Neon Postgres")
 
     if not DB_READY:
         async with POOL.acquire() as conn:
@@ -96,8 +98,8 @@ async def get_pool() -> asyncpg.Pool:
 
             if os.path.exists(CATEGORIES_PATH):
                 with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
-                    cats = json.load(f)
-                    for cat in cats.keys():
+                    categories = json.load(f)
+                    for cat in categories.keys():
                         await conn.execute(
                             """
                             INSERT INTO categories(name)
@@ -108,7 +110,7 @@ async def get_pool() -> asyncpg.Pool:
                         )
 
         DB_READY = True
-        print("✅ Neon database initialized")
+        print("✅ Database initialized")
 
     return POOL
 
@@ -179,22 +181,31 @@ async def add_split_expense(
     async with pool.acquire() as conn:
         async with conn.transaction():
 
+            # payer
             payer_id = await get_user_id(conn, paid_by)
-            participant_ids = {
-                p: await get_user_id(conn, p)
-                for p in participants
-            }
+
+            # participants — IMPORTANT: sequential
+            participant_ids = {}
+            for p in participants:
+                participant_ids[p] = await get_user_id(conn, p)
 
             cat_id = await get_category_id(conn, category)
 
+            # split logic
             if split_type == "equal":
-                share = round(amount / len(participants), 2)
+                share = round(float(amount) / len(participants), 2)
                 split_map = {p: share for p in participants}
+
             elif split_type == "unequal":
+                if not splits:
+                    raise ValueError("splits required")
                 split_map = splits
-            else:
+
+            else:  # percent
+                if not splits:
+                    raise ValueError("splits required")
                 split_map = {
-                    u: round(amount * p / 100, 2)
+                    u: round(float(amount) * p / 100, 2)
                     for u, p in splits.items()
                 }
 
@@ -205,8 +216,12 @@ async def add_split_expense(
                 VALUES ($1,$2,$3,$4,$5,$6)
                 RETURNING id
                 """,
-                amount, cat_id, description,
-                expense_date, payer_id, split_type
+                amount,
+                cat_id,
+                description,
+                expense_date,
+                payer_id,
+                split_type
             )
 
             expense_id = row["id"]
@@ -219,7 +234,9 @@ async def add_split_expense(
                     INSERT INTO expense_splits(expense_id,user_id,amount)
                     VALUES ($1,$2,$3)
                     """,
-                    expense_id, uid, amt
+                    expense_id,
+                    uid,
+                    amt
                 )
 
                 if uid != payer_id:
@@ -231,7 +248,9 @@ async def add_split_expense(
                         DO UPDATE
                         SET amount = balances.amount + EXCLUDED.amount
                         """,
-                        uid, payer_id, amt
+                        uid,
+                        payer_id,
+                        amt
                     )
 
     return {"status": "ok", "expense_id": expense_id}
@@ -251,13 +270,17 @@ async def get_balances():
             ORDER BY b.amount DESC
         """)
     return [
-        {"from": r["from_user"], "to": r["to_user"], "amount": float(r["amount"])}
+        {
+            "from": r["from_user"],
+            "to": r["to_user"],
+            "amount": float(r["amount"])
+        }
         for r in rows
     ]
 
 
 # ==================================================
-# RESOURCE
+# MCP RESOURCE
 # ==================================================
 @mcp.resource("expense:///categories", mime_type="application/json")
 def categories():
@@ -266,7 +289,7 @@ def categories():
 
 
 # ==================================================
-# RUN
+# RUN SERVER
 # ==================================================
 if __name__ == "__main__":
     mcp.run(transport="http", host="0.0.0.0", port=8000)
