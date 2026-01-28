@@ -1,143 +1,166 @@
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastmcp import FastMCP
 import os
 import json
-import sqlite3
-import aiosqlite
-import tempfile
-from datetime import datetime, date
-from typing import Optional, List, Dict, Any
+import asyncpg
+from datetime import date
+from typing import Optional, List, Dict
 
 # ==================================================
 # CONFIG
 # ==================================================
-
-TEMP_DIR = tempfile.gettempdir()
-DB_PATH = os.path.join(TEMP_DIR, "expenses.db")
+DB_DSN = os.environ.get("DATABASE_URL")
+if not DB_DSN:
+    raise RuntimeError("Please set DATABASE_URL")
 
 BASE_DIR = os.path.dirname(__file__)
 CATEGORIES_PATH = os.path.join(BASE_DIR, "categories.json")
 
 mcp = FastMCP("AniTracker")
 
+POOL: asyncpg.Pool | None = None
+DB_READY = False
+
+
 # ==================================================
-# SYNC DATABASE INIT (SAFE)
+# SQL
 # ==================================================
+CREATE_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
 
-def init_db():
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("PRAGMA foreign_keys = ON;")
+CREATE TABLE IF NOT EXISTS categories (
+    id SERIAL PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL
+);
 
-        conn.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
+CREATE TABLE IF NOT EXISTS expenses (
+    id SERIAL PRIMARY KEY,
+    amount NUMERIC NOT NULL CHECK (amount > 0),
+    category_id INTEGER NOT NULL REFERENCES categories(id),
+    description TEXT,
+    expense_date DATE NOT NULL,
+    paid_by INTEGER NOT NULL REFERENCES users(id),
+    split_type TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
 
-        CREATE TABLE IF NOT EXISTS categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL
-        );
+CREATE TABLE IF NOT EXISTS expense_splits (
+    id SERIAL PRIMARY KEY,
+    expense_id INTEGER NOT NULL REFERENCES expenses(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    amount NUMERIC NOT NULL,
+    UNIQUE(expense_id, user_id)
+);
 
-        CREATE TABLE IF NOT EXISTS expenses (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            amount REAL NOT NULL CHECK(amount > 0),
-            category_id INTEGER NOT NULL,
-            description TEXT,
-            expense_date TEXT NOT NULL,
-            paid_by INTEGER NOT NULL,
-            split_type TEXT NOT NULL,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (category_id) REFERENCES categories(id),
-            FOREIGN KEY (paid_by) REFERENCES users(id)
-        );
+CREATE TABLE IF NOT EXISTS balances (
+    from_user INTEGER NOT NULL,
+    to_user INTEGER NOT NULL,
+    amount NUMERIC NOT NULL,
+    PRIMARY KEY (from_user, to_user)
+);
 
-        CREATE TABLE IF NOT EXISTS expense_splits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            expense_id INTEGER NOT NULL,
-            user_id INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            FOREIGN KEY (expense_id) REFERENCES expenses(id) ON DELETE CASCADE,
-            FOREIGN KEY (user_id) REFERENCES users(id),
-            UNIQUE(expense_id, user_id)
-        );
+CREATE TABLE IF NOT EXISTS settlements (
+    id SERIAL PRIMARY KEY,
+    from_user INTEGER NOT NULL,
+    to_user INTEGER NOT NULL,
+    amount NUMERIC NOT NULL,
+    settlement_date DATE NOT NULL,
+    note TEXT,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+"""
 
-        CREATE TABLE IF NOT EXISTS balances (
-            from_user INTEGER NOT NULL,
-            to_user INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            PRIMARY KEY (from_user, to_user)
-        );
 
-        CREATE TABLE IF NOT EXISTS settlements (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            from_user INTEGER NOT NULL,
-            to_user INTEGER NOT NULL,
-            amount REAL NOT NULL,
-            settlement_date TEXT NOT NULL,
-            note TEXT,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-        """)
+# ==================================================
+# LAZY INITIALIZATION (CRITICAL)
+# ==================================================
+async def get_pool() -> asyncpg.Pool:
+    global POOL, DB_READY
 
-        if os.path.exists(CATEGORIES_PATH):
-            with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
-                cats = json.load(f)
-                for cat in cats.keys():
-                    conn.execute(
-                        "INSERT OR IGNORE INTO categories(name) VALUES (?)",
-                        (cat,)
-                    )
+    if POOL is None:
+        POOL = await asyncpg.create_pool(
+            dsn=DB_DSN,
+            min_size=1,
+            max_size=5,
+        )
 
-        conn.commit()
+    if not DB_READY:
+        async with POOL.acquire() as conn:
+            await conn.execute(CREATE_SQL)
 
-# Initialize immediately (safe)
-init_db()
+            if os.path.exists(CATEGORIES_PATH):
+                with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
+                    cats = json.load(f)
+                    for cat in cats.keys():
+                        await conn.execute(
+                            """
+                            INSERT INTO categories(name)
+                            VALUES ($1)
+                            ON CONFLICT (name) DO NOTHING
+                            """,
+                            cat,
+                        )
+
+        DB_READY = True
+        print("✅ Neon database initialized")
+
+    return POOL
+
 
 # ==================================================
 # HELPERS
 # ==================================================
-
 def normalize_date(d: Optional[str]) -> str:
     if not d:
         return date.today().isoformat()
+    from datetime import datetime
     datetime.strptime(d, "%Y-%m-%d")
     return d
 
+
 async def get_user_id(conn, name: str) -> int:
-    async with conn.execute(
-        "SELECT id FROM users WHERE name=?", (name.strip(),)
-    ) as cur:
-        row = await cur.fetchone()
-
-    if row:
-        return row[0]
-
-    cur = await conn.execute(
-        "INSERT INTO users(name) VALUES (?)", (name.strip(),)
+    row = await conn.fetchrow(
+        "SELECT id FROM users WHERE name=$1",
+        name.strip()
     )
-    return cur.lastrowid
+    if row:
+        return row["id"]
+
+    row = await conn.fetchrow(
+        "INSERT INTO users(name) VALUES ($1) RETURNING id",
+        name.strip()
+    )
+    return row["id"]
+
 
 async def get_category_id(conn, name: str) -> int:
-    async with conn.execute(
-        "SELECT id FROM categories WHERE name=?", (name.strip(),)
-    ) as cur:
-        row = await cur.fetchone()
-
+    row = await conn.fetchrow(
+        "SELECT id FROM categories WHERE name=$1",
+        name.strip()
+    )
     if not row:
         raise ValueError(f"Invalid category: {name}")
+    return row["id"]
 
-    return row[0]
 
 # ==================================================
 # MCP TOOLS
 # ==================================================
-
 @mcp.tool()
 async def list_users():
-    async with aiosqlite.connect(DB_PATH) as conn:
-        async with conn.execute("SELECT id, name FROM users ORDER BY name") as cur:
-            return [{"id": r[0], "name": r[1]} for r in await cur.fetchall()]
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT id, name FROM users ORDER BY name"
+        )
+    return [{"id": r["id"], "name": r["name"]} for r in rows]
+
 
 @mcp.tool()
 async def add_split_expense(
@@ -150,81 +173,100 @@ async def add_split_expense(
     description: Optional[str] = None,
     expense_date: Optional[str] = None,
 ):
+    pool = await get_pool()
     expense_date = normalize_date(expense_date)
 
-    async with aiosqlite.connect(DB_PATH) as conn:
-        payer_id = await get_user_id(conn, paid_by)
-        participant_ids = {p: await get_user_id(conn, p) for p in participants}
-        cat_id = await get_category_id(conn, category)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
 
-        if split_type == "equal":
-            share = round(amount / len(participants), 2)
-            split_map = {p: share for p in participants}
-        elif split_type == "unequal":
-            split_map = splits
-        else:
-            split_map = {u: round(amount * p / 100, 2) for u, p in splits.items()}
+            payer_id = await get_user_id(conn, paid_by)
+            participant_ids = {
+                p: await get_user_id(conn, p)
+                for p in participants
+            }
 
-        cur = await conn.execute(
-            """
-            INSERT INTO expenses
-            (amount, category_id, description, expense_date, paid_by, split_type)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (amount, cat_id, description, expense_date, payer_id, split_type),
-        )
+            cat_id = await get_category_id(conn, category)
 
-        expense_id = cur.lastrowid
+            if split_type == "equal":
+                share = round(amount / len(participants), 2)
+                split_map = {p: share for p in participants}
+            elif split_type == "unequal":
+                split_map = splits
+            else:
+                split_map = {
+                    u: round(amount * p / 100, 2)
+                    for u, p in splits.items()
+                }
 
-        for user, amt in split_map.items():
-            uid = participant_ids[user]
-            await conn.execute(
-                "INSERT INTO expense_splits(expense_id, user_id, amount) VALUES (?, ?, ?)",
-                (expense_id, uid, amt),
+            row = await conn.fetchrow(
+                """
+                INSERT INTO expenses
+                (amount, category_id, description, expense_date, paid_by, split_type)
+                VALUES ($1,$2,$3,$4,$5,$6)
+                RETURNING id
+                """,
+                amount, cat_id, description,
+                expense_date, payer_id, split_type
             )
 
-            if uid != payer_id:
+            expense_id = row["id"]
+
+            for user, amt in split_map.items():
+                uid = participant_ids[user]
+
                 await conn.execute(
                     """
-                    INSERT INTO balances(from_user, to_user, amount)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(from_user, to_user)
-                    DO UPDATE SET amount = amount + excluded.amount
+                    INSERT INTO expense_splits(expense_id,user_id,amount)
+                    VALUES ($1,$2,$3)
                     """,
-                    (uid, payer_id, amt),
+                    expense_id, uid, amt
                 )
 
-        await conn.commit()
+                if uid != payer_id:
+                    await conn.execute(
+                        """
+                        INSERT INTO balances(from_user,to_user,amount)
+                        VALUES ($1,$2,$3)
+                        ON CONFLICT (from_user,to_user)
+                        DO UPDATE
+                        SET amount = balances.amount + EXCLUDED.amount
+                        """,
+                        uid, payer_id, amt
+                    )
 
     return {"status": "ok", "expense_id": expense_id}
 
+
 @mcp.tool()
 async def get_balances():
-    async with aiosqlite.connect(DB_PATH) as conn:
-        async with conn.execute("""
-            SELECT u1.name, u2.name, b.amount
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT u1.name AS from_user,
+                   u2.name AS to_user,
+                   b.amount
             FROM balances b
             JOIN users u1 ON u1.id = b.from_user
             JOIN users u2 ON u2.id = b.to_user
             ORDER BY b.amount DESC
-        """) as cur:
-            return [
-                {"from": r[0], "to": r[1], "amount": r[2]}
-                for r in await cur.fetchall()
-            ]
+        """)
+    return [
+        {"from": r["from_user"], "to": r["to_user"], "amount": float(r["amount"])}
+        for r in rows
+    ]
+
 
 # ==================================================
-# MCP RESOURCE
+# RESOURCE
 # ==================================================
-
 @mcp.resource("expense:///categories", mime_type="application/json")
 def categories():
     with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
         return f.read()
 
-# ==================================================
-# START SERVER
-# ==================================================
 
+# ==================================================
+# RUN
+# ==================================================
 if __name__ == "__main__":
     mcp.run(transport="http", host="0.0.0.0", port=8000)
