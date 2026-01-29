@@ -280,18 +280,24 @@ async def add_split_expense(
                     "split_type must be: equal | unequal | percent"
                 )
 
+            if isinstance(expense_date, str):
+                expense_date = datetime.strptime(
+                    expense_date, "%Y-%m-%d"
+                ).date()
+
+
             row = await conn.fetchrow(
                 """
                 INSERT INTO expenses
                 (amount, category_id, description,
-                 expense_date, paid_by, split_type)
+                expense_date, paid_by, split_type)
                 VALUES ($1,$2,$3,$4,$5,$6)
                 RETURNING id
                 """,
                 amount,
                 cat_id,
                 description,
-                expense_date,
+                expense_date,   # now guaranteed date object
                 payer_id,
                 split_type,
             )
